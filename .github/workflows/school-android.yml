@@ -1,0 +1,193 @@
+# School Android Build（school-custom 定制版）
+# 为校内课堂投屏定制分支构建 Android APK（含预置校内服务器配置）。
+# 触发：手动 dispatch，或 push 到 school-custom 且改动源码/工作流。
+# 产物：Actions 页面对应 run 的 Artifacts（arm64-v8a / armeabi-v7a release APK）。
+#
+# 签名说明：优先使用 secrets（ANDROID_SIGNING_KEY_BASE64 / ANDROID_SIGNING_KEY_STORE_PASS /
+# ANDROID_SIGNING_KEY_ALIAS / ANDROID_SIGNING_KEY_KEY_PASS）；未配置时自动生成自签名
+# keystore 并用 actions/cache 固定（key: school-keystore-v1），保证多次构建签名一致，
+# 平板覆盖安装不会被签名变更阻断。
+
+name: School Android Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: '备注（可选，如"替换公钥后首次构建"）'
+        type: string
+        default: ''
+  push:
+    branches: [school-custom]
+    paths:
+      - 'libs/**'
+      - 'src/**'
+      - 'flutter/**'
+      - '.github/workflows/school-android.yml'
+
+env:
+  RUST_VERSION: "1.75"          # 与上游 flutter-build.yml 一致
+  CARGO_NDK_VERSION: "3.1.2"
+  FLUTTER_VERSION: "3.24.5"
+  NDK_VERSION: "r28c"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+  APP_NAME_PREFIX: "school-rustdesk"
+  SIGNING_KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+  SIGNING_STORE_PASS: ${{ secrets.ANDROID_SIGNING_KEY_STORE_PASS }}
+  SIGNING_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+  SIGNING_KEY_PASS: ${{ secrets.ANDROID_SIGNING_KEY_KEY_PASS }}
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-android:
+    name: android ${{ matrix.abi }}
+    needs: [generate-bridge]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            abi: arm64-v8a
+            ndk-script: ndk_arm64.sh
+            sysroot-lib: aarch64-linux-android
+            flutter-platform: android-arm64
+          - target: armv7-linux-androideabi
+            abi: armeabi-v7a
+            ndk-script: ndk_arm.sh
+            sysroot-lib: arm-linux-androideabi
+            flutter-platform: android-arm
+
+    steps:
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang cmake curl wget git g++ ninja-build pkg-config \
+            libclang-dev llvm-dev openjdk-17-jdk-headless tree
+
+      - name: Checkout（含子模块，取 school-custom 定制）
+        uses: actions/checkout@v4
+        with:
+          ref: school-custom
+          submodules: recursive
+
+      - name: 安装 Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: 应用上游 Flutter 补丁
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: 安装 Android NDK ${{ env.NDK_VERSION }}
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+
+      - name: vcpkg 依赖（${{ matrix.abi }} 原生库）
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+
+      - name: 构建 ${{ matrix.abi }} 原生依赖
+        run: |
+          if ! ./flutter/build_android_deps.sh "${{ matrix.abi }}"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r f; do
+              echo "== $f =="; cat "$f"
+            done
+            exit 1
+          fi
+        shell: bash
+
+      - name: 下载 bridge 生成产物
+        uses: actions/download-artifact@v4
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: 安装 Rust ${{ env.RUST_VERSION }}
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1（与上游一致）
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: school-rustdesk-android
+          key: ${{ matrix.target }}
+
+      - name: 构建 Rust 库（cargo-ndk）
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          ./flutter/${{ matrix.ndk-script }}
+          mkdir -p ./flutter/android/app/src/main/jniLibs/${{ matrix.abi }}
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.sysroot-lib }}/libc++_shared.so ./flutter/android/app/src/main/jniLibs/${{ matrix.abi }}/
+          cp ./target/${{ matrix.target }}/release/liblibrustdesk.so ./flutter/android/app/src/main/jniLibs/${{ matrix.abi }}/librustdesk.so
+
+      - name: 恢复自签名 keystore 缓存（保证签名跨构建一致）
+        if: ${{ env.SIGNING_KEY_B64 == '' }}
+        uses: actions/cache@v4
+        with:
+          path: .keystore-cache
+          key: school-keystore-v1
+
+      - name: 准备签名（secrets 优先，否则自签名 keystore）
+        run: |
+          if [ -n "$SIGNING_KEY_B64" ]; then
+            echo "$SIGNING_KEY_B64" | base64 -d > school-release.jks
+            STORE_PASS="$SIGNING_STORE_PASS"; ALIAS="$SIGNING_ALIAS"; KEY_PASS="$SIGNING_KEY_PASS"
+          else
+            mkdir -p .keystore-cache
+            if [ ! -f .keystore-cache/school-release.jks ]; then
+              keytool -genkeypair -v \
+                -keystore .keystore-cache/school-release.jks \
+                -alias school-cast -keyalg RSA -keysize 2048 -validity 36500 \
+                -storepass schoolcast123 -keypass schoolcast123 \
+                -dname "CN=Classroom Cast, OU=School, O=School, C=CN"
+            fi
+            cp .keystore-cache/school-release.jks school-release.jks
+            STORE_PASS="schoolcast123"; ALIAS="school-cast"; KEY_PASS="schoolcast123"
+          fi
+          cat > flutter/android/key.properties <<EOF
+          storePassword=$STORE_PASS
+          keyPassword=$KEY_PASS
+          keyAlias=$ALIAS
+          storeFile=$(realpath school-release.jks)
+          EOF
+
+      - name: 校验预置配置（防呆：确认校内服务器已编入）
+        run: |
+          grep -q "192.168.8.10" libs/hbb_common/src/config.rs || { echo "默认服务器不是校内地址！"; exit 1; }
+          if grep -q "REPLACE_WITH_HBBS_ID_ED25519_PUB" libs/hbb_common/src/config.rs; then
+            echo "::warning::RS_PUB_KEY 仍是占位值，此 APK 无法通过校内服务器公钥校验（公钥未替换）！"
+          else
+            echo "公钥已预置 ✔"
+          fi
+
+      - name: flutter build apk（release，split-per-abi）
+        run: |
+          pushd flutter
+          flutter pub get
+          flutter build apk --release --target-platform ${{ matrix.flutter-platform }} --split-per-abi
+          popd
+          mkdir -p out
+          mv flutter/build/app/outputs/flutter-apk/app-${{ matrix.abi }}-release.apk \
+             out/${{ env.APP_NAME_PREFIX }}-${{ matrix.abi }}.apk
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME_PREFIX }}-${{ matrix.abi }}
+          path: out/*.apk
